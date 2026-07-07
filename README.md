@@ -238,6 +238,8 @@ if err != nil {
 }
 ```
 
+__N.B.:__ CredSSP binds authentication state and its TLS tunnel to a single connection, so all requests on a CredSSP client are serialized. Because a long-polling output `Receive` holds that lock until it returns, concurrent stdin sends are stalled behind each poll. Real-time interactive stdin is therefore not supported over CredSSP; non-interactive `RunCmd`/`RunPS` (no stdin) are unaffected.
+
 ### Running opt-in CredSSP integration tests
 The CredSSP live integration test is disabled by default and only compiled when using the `credssp_integration` build tag.
 

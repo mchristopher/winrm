@@ -163,12 +163,18 @@ func (e *Encryption) PrepareEncryptedRequest(client *Client, endpoint string, me
 			message_chunks = append(message_chunks, message[i:end])
 		}
 		for _, message_chunk := range message_chunks {
-			encrypted_chunk := e.encryptMessage(message_chunk, host)
+			encrypted_chunk, err := e.encryptMessage(message_chunk, host)
+			if err != nil {
+				return "", err
+			}
 			encrypted_message = append(encrypted_message, encrypted_chunk...)
 		}
 	} else {
 		content_type = "multipart/encrypted"
-		encrypted_message = e.encryptMessage(message, host)
+		encrypted_message, err = e.encryptMessage(message, host)
+		if err != nil {
+			return "", err
+		}
 	}
 
 	encrypted_message = append(encrypted_message, []byte(mimeBoundary)...)
@@ -221,8 +227,13 @@ func (e *Encryption) ParseEncryptedResponse(response *http.Response) ([]byte, er
 	return body, nil
 }
 
-func (e *Encryption) encryptMessage(message []byte, host string) []byte {
-	encryptedStream, _ := e.buildMessage(message, host)
+func (e *Encryption) encryptMessage(message []byte, host string) ([]byte, error) {
+	// For CredSSP, buildMessage performs a real TLS write that can fail or time
+	// out, so the error must be surfaced rather than producing a malformed body.
+	encryptedStream, err := e.buildMessage(message, host)
+	if err != nil {
+		return nil, err
+	}
 
 	messagePayload := bytes.Join([][]byte{
 		[]byte(mimeBoundary),
@@ -235,7 +246,7 @@ func (e *Encryption) encryptMessage(message []byte, host string) []byte {
 		encryptedStream,
 	}, []byte{})
 
-	return messagePayload
+	return messagePayload, nil
 }
 
 func deleteEmpty(b [][]byte) [][]byte {

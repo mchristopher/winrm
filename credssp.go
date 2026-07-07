@@ -32,6 +32,12 @@ const (
 	// zero (unbounded) endpoint timeout.
 	defaultCredSSPTimeout = 60 * time.Second
 
+	// credSSPHandshakeDrainSettle is the idle window used to coalesce a full TLS
+	// handshake flight (which crypto/tls may emit as several back-to-back
+	// writes) into a single CredSSP token exchange, avoiding a partial flight
+	// being POSTed on its own.
+	credSSPHandshakeDrainSettle = 20 * time.Millisecond
+
 	credSSPClientBindingLabel = "CredSSP Client-To-Server Binding Hash\x00"
 	credSSPServerBindingLabel = "CredSSP Server-To-Client Binding Hash\x00"
 )
@@ -164,6 +170,34 @@ func (c *credSSPMemoryConn) drainOutgoing(first []byte) []byte {
 	}
 }
 
+// drainOutgoingWithin coalesces the first chunk with any further chunks that
+// arrive within the settle window. Unlike drainOutgoing (which returns as soon
+// as the channel is momentarily empty), this waits a short idle period so a
+// multi-write TLS flight produced by a concurrent handshake goroutine is not
+// split across separate CredSSP token exchanges.
+func (c *credSSPMemoryConn) drainOutgoingWithin(first []byte, settle time.Duration) []byte {
+	payload := append([]byte(nil), first...)
+	timer := time.NewTimer(settle)
+	defer timer.Stop()
+	for {
+		select {
+		case extra := <-c.outgoing:
+			payload = append(payload, extra...)
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(settle)
+		case <-timer.C:
+			return payload
+		case <-c.closeCh:
+			return payload
+		}
+	}
+}
+
 type dummyAddr string
 
 func (d dummyAddr) Network() string {
@@ -186,7 +220,13 @@ type ClientCredSSP struct {
 	encryption *Encryption
 
 	handshakeComplete bool
-	mu                sync.Mutex
+	// mu serializes all Post calls. CredSSP authentication state and the TLS
+	// tunnel are bound to a single connection and are not safe for concurrent
+	// use, so requests must run one at a time. A consequence is that a
+	// long-polling Receive holds the lock until it returns, so concurrent
+	// stdin sends are stalled behind it; real-time interactive stdin is
+	// therefore not supported over CredSSP.
+	mu sync.Mutex
 }
 
 // NewClientCredSSPWithDial creates a CredSSP client with custom dialer.
@@ -218,6 +258,20 @@ func (c *ClientCredSSP) Transport(endpoint *Endpoint) error {
 		return err
 	}
 	c.endpoint = endpoint
+
+	// Server-side CredSSP auth state lives on the specific TCP connection that
+	// completed the handshake, so every subsequent encrypted request must reuse
+	// that same connection. Pin the transport to a single, long-lived keep-alive
+	// connection so http.Transport cannot silently open a fresh (unauthenticated)
+	// socket for a later request.
+	if transport, ok := c.clientRequest.transport.(*http.Transport); ok {
+		transport.DisableKeepAlives = false
+		transport.MaxConnsPerHost = 1
+		transport.MaxIdleConns = 1
+		transport.MaxIdleConnsPerHost = 1
+		transport.IdleConnTimeout = 0
+	}
+
 	c.httpClient = &http.Client{Transport: c.clientRequest.transport}
 	return nil
 }
@@ -277,9 +331,11 @@ func (c *ClientCredSSP) ensureHandshake(client *Client) error {
 			c.handshakeComplete = true
 			return nil
 		case out := <-memConn.outgoing:
-			// Drain the whole TLS flight (crypto/tls may emit several writes
-			// per flight) into a single CredSSP token exchange.
-			token, err := c.exchangeCredSSPToken(client.url, memConn.drainOutgoing(out), true)
+			// Coalesce the whole TLS flight (crypto/tls may emit several writes
+			// per flight from the handshake goroutine) into a single CredSSP
+			// token exchange, waiting a short settle window so a partial flight
+			// is never POSTed on its own.
+			token, err := c.exchangeCredSSPToken(client.url, memConn.drainOutgoingWithin(out, credSSPHandshakeDrainSettle), true)
 			if err != nil {
 				_ = memConn.Close()
 				return err
@@ -341,6 +397,9 @@ func (c *ClientCredSSP) performCredSSPAuth(client *Client) error {
 	if err != nil {
 		return err
 	}
+	if err := credSSPResponseError(challengeResponse); err != nil {
+		return err
+	}
 	if challengeResponse == nil || len(challengeResponse.NegoTokens) == 0 {
 		return errors.New("credssp challenge response missing NTLM challenge")
 	}
@@ -389,6 +448,9 @@ func (c *ClientCredSSP) performCredSSPAuth(client *Client) error {
 	if err != nil {
 		return err
 	}
+	if err := credSSPResponseError(pubKeyResponse); err != nil {
+		return err
+	}
 	if pubKeyResponse == nil || len(pubKeyResponse.PubKeyAuth) == 0 {
 		return errors.New("credssp pubKeyAuth response missing")
 	}
@@ -421,6 +483,16 @@ func (c *ClientCredSSP) performCredSSPAuth(client *Client) error {
 	}
 
 	c.ntlmClient = ntlmClient
+	return nil
+}
+
+// credSSPResponseError returns an error if a server TSRequest carries a
+// non-zero NTSTATUS error code, so authentication failures (bad credentials,
+// policy denial, etc.) surface directly instead of as a vague downstream error.
+func credSSPResponseError(response *tsRequest) error {
+	if response != nil && response.ErrorCode != 0 {
+		return fmt.Errorf("credssp server returned error code 0x%08X", uint32(response.ErrorCode))
+	}
 	return nil
 }
 

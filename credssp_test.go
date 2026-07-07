@@ -328,6 +328,33 @@ func (s *WinRMSuite) TestCredSSPReplyRequiredFailsWithoutToken(c *C) {
 	c.Assert(err, NotNil)
 }
 
+// TestCredSSPResponseErrorCode guards that a server TSRequest carrying an
+// NTSTATUS error code is surfaced instead of being ignored.
+func (s *WinRMSuite) TestCredSSPResponseErrorCode(c *C) {
+	c.Assert(credSSPResponseError(nil), IsNil)
+	c.Assert(credSSPResponseError(&tsRequest{Version: credSSPDefaultVersion}), IsNil)
+
+	encoded, err := marshalTSRequest(tsRequest{Version: credSSPDefaultVersion, ErrorCode: 0x05})
+	c.Assert(err, IsNil)
+	decoded, err := unmarshalTSRequest(encoded)
+	c.Assert(err, IsNil)
+
+	err = credSSPResponseError(decoded)
+	c.Assert(err, NotNil)
+	c.Assert(err.Error(), Contains, "0x00000005")
+}
+
+// TestCredSSPEncryptMessagePropagatesError ensures a tunnel failure during
+// message wrapping is returned instead of silently producing a malformed body.
+func (s *WinRMSuite) TestCredSSPEncryptMessagePropagatesError(c *C) {
+	encryption, err := NewEncryption("credssp")
+	c.Assert(err, IsNil)
+
+	// tlsConn/credsspConn are unset, so buildCredSSPMessage fails.
+	_, err = encryption.encryptMessage([]byte("payload"), "host")
+	c.Assert(err, NotNil)
+}
+
 // TestCredSSPMemoryConnCloseRace guards finding 7: Close must not race with
 // concurrent pushIncoming senders (a closed incoming channel would panic).
 func TestCredSSPMemoryConnCloseRace(t *testing.T) {
