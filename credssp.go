@@ -276,7 +276,7 @@ func (c *ClientCredSSP) tlsConfig() *tls.Config {
 		MinVersion:         tls.VersionTLS12,
 	}
 
-	if c.endpoint.CACert != nil && len(c.endpoint.CACert) > 0 {
+	if len(c.endpoint.CACert) > 0 {
 		if certPool, err := readCACerts(c.endpoint.CACert); err == nil {
 			cfg.RootCAs = certPool
 			cfg.InsecureSkipVerify = c.endpoint.Insecure
@@ -563,16 +563,4 @@ func findCredSSPToken(headers http.Header) ([]byte, bool, error) {
 		}
 	}
 	return nil, false, nil
-}
-
-func splitUsername(input string) (string, string) {
-	if strings.Contains(input, "@") {
-		parts := strings.SplitN(input, "@", 2)
-		return parts[0], parts[1]
-	}
-	if strings.Contains(input, "\\") {
-		parts := strings.SplitN(input, "\\", 2)
-		return parts[1], parts[0]
-	}
-	return input, ""
 }

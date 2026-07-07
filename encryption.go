@@ -475,3 +475,15 @@ func (e *Encryption) getCredSSPTrailerLength(messageLength int, cipherSuite stri
 	}
 	return trailerLength
 }
+
+func splitUsername(input string) (string, string) {
+	if strings.Contains(input, "@") {
+		parts := strings.SplitN(input, "@", 2)
+		return parts[0], parts[1]
+	}
+	if strings.Contains(input, "\\") {
+		parts := strings.SplitN(input, "\\", 2)
+		return parts[1], parts[0]
+	}
+	return input, ""
+}
