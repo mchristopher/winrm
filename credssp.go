@@ -404,7 +404,7 @@ func (c *ClientCredSSP) ensureHandshake(client *Client) error {
 			token, err := c.exchangeCredSSPToken(client.url, memConn.drainOutgoingWithin(out, credSSPHandshakeDrainSettle), true)
 			if err != nil {
 				_ = memConn.Close()
-				return err
+				return fmt.Errorf("credssp tls handshake token exchange: %w", err)
 			}
 			if len(token) > 0 {
 				if err := memConn.pushIncoming(token); err != nil {
@@ -471,7 +471,7 @@ func (c *ClientCredSSP) performCredSSPAuth(client *Client) error {
 
 	challengeResponse, err := c.sendTSRequest(client.url, challengeRequest)
 	if err != nil {
-		return err
+		return fmt.Errorf("credssp negotiate/challenge exchange: %w", err)
 	}
 	if err := credSSPResponseError(challengeResponse); err != nil {
 		return err
@@ -523,7 +523,7 @@ func (c *ClientCredSSP) performCredSSPAuth(client *Client) error {
 		ClientNonce: nonce,
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("credssp authenticate/pubKeyAuth exchange: %w", err)
 	}
 	if err := credSSPResponseError(pubKeyResponse); err != nil {
 		return err
@@ -556,7 +556,7 @@ func (c *ClientCredSSP) performCredSSPAuth(client *Client) error {
 		Version:  version,
 		AuthInfo: wrappedCredentials,
 	}); err != nil {
-		return err
+		return fmt.Errorf("credssp authInfo exchange: %w", err)
 	}
 
 	return nil
