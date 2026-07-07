@@ -54,6 +54,11 @@ func credSSPTimeout(d time.Duration) time.Duration {
 
 var (
 	errCredSSPClosed = errors.New("credssp connection is closed")
+
+	// errCredSSPReauthRequired signals that the server rejected an encrypted
+	// request as unauthenticated (HTTP 401), typically because the pinned
+	// connection was dropped and re-dialed. It triggers a one-shot re-handshake.
+	errCredSSPReauthRequired = errors.New("credssp re-authentication required")
 )
 
 type credSSPMemoryConn struct {
@@ -245,6 +250,13 @@ func (d dummyAddr) String() string {
 type ClientCredSSP struct {
 	clientRequest
 
+	// MinimumVersion, when set, requires the server to negotiate at least this
+	// CredSSP version. CredSSP versions 2-4 use the pre-CVE-2018-0886 public-key
+	// binding, so a server claiming an old version silently downgrades the
+	// binding scheme. Set MinimumVersion to 5 to refuse that downgrade. Zero
+	// means only the protocol floor (version 2) is enforced.
+	MinimumVersion int
+
 	httpClient *http.Client
 	endpoint   *Endpoint
 	memConn    *credSSPMemoryConn
@@ -313,6 +325,19 @@ func (c *ClientCredSSP) Post(client *Client, request *soap.SoapMessage) (string,
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	body, err := c.post(client, request)
+	if err != nil && errors.Is(err, errCredSSPReauthRequired) {
+		// The server likely closed the idle keep-alive connection, so the
+		// transport dialed a fresh, unauthenticated socket and rejected the
+		// request. Reset CredSSP state and re-run the handshake once. A 401 is
+		// safe to retry because the server never processed the request.
+		c.resetHandshakeState()
+		body, err = c.post(client, request)
+	}
+	return body, err
+}
+
+func (c *ClientCredSSP) post(client *Client, request *soap.SoapMessage) (string, error) {
 	if err := c.ensureHandshake(client); err != nil {
 		return "", err
 	}
@@ -332,13 +357,30 @@ func (c *ClientCredSSP) Post(client *Client, request *soap.SoapMessage) (string,
 	return c.encryption.PrepareEncryptedRequest(client, client.url, []byte(request.String()))
 }
 
+// resetHandshakeState discards the current CredSSP session so the next Post
+// re-runs the handshake on a fresh connection.
+func (c *ClientCredSSP) resetHandshakeState() {
+	if c.memConn != nil {
+		_ = c.memConn.Close()
+	}
+	c.handshakeComplete = false
+	c.memConn = nil
+	c.tlsConn = nil
+	c.encryption = nil
+}
+
 func (c *ClientCredSSP) ensureHandshake(client *Client) error {
 	if c.handshakeComplete {
 		return nil
 	}
 
+	cfg, err := c.tlsConfig()
+	if err != nil {
+		return err
+	}
+
 	memConn := newCredSSPMemoryConn()
-	tlsConn := tls.Client(memConn, c.tlsConfig())
+	tlsConn := tls.Client(memConn, cfg)
 
 	handshakeErr := make(chan error, 1)
 	go func() {
@@ -380,10 +422,10 @@ func (c *ClientCredSSP) ensureHandshake(client *Client) error {
 	}
 }
 
-func (c *ClientCredSSP) tlsConfig() *tls.Config {
+func (c *ClientCredSSP) tlsConfig() (*tls.Config, error) {
 	cfg := &tls.Config{
 		//nolint:gosec
-		InsecureSkipVerify: c.endpoint.Insecure || len(c.endpoint.CACert) == 0,
+		InsecureSkipVerify: c.endpoint.Insecure,
 		ServerName:         c.endpoint.TLSServerName,
 		// Pin TLS 1.2: the header-pump assumes strict request/response
 		// lockstep, and TLS 1.3 completes the client handshake without a
@@ -394,12 +436,24 @@ func (c *ClientCredSSP) tlsConfig() *tls.Config {
 	}
 
 	if len(c.endpoint.CACert) > 0 {
-		if certPool, err := readCACerts(c.endpoint.CACert); err == nil {
-			cfg.RootCAs = certPool
-			cfg.InsecureSkipVerify = c.endpoint.Insecure
+		certPool, err := readCACerts(c.endpoint.CACert)
+		if err != nil {
+			return nil, err
 		}
+		cfg.RootCAs = certPool
+	} else if !c.endpoint.Insecure {
+		// Without a CA there is nothing to verify against; self-signed certs are
+		// normal for CredSSP, so skip verification.
+		cfg.InsecureSkipVerify = true
 	}
-	return cfg
+
+	// crypto/tls requires a ServerName (or InsecureSkipVerify) to verify a
+	// certificate; default it to the endpoint host so a CA-only config works.
+	if !cfg.InsecureSkipVerify && cfg.ServerName == "" {
+		cfg.ServerName = c.endpoint.Host
+	}
+
+	return cfg, nil
 }
 
 func (c *ClientCredSSP) performCredSSPAuth(client *Client) error {
@@ -413,14 +467,12 @@ func (c *ClientCredSSP) performCredSSPAuth(client *Client) error {
 		return err
 	}
 
-	version := credSSPDefaultVersion
-
 	negoToken, err := ntlmClient.Authenticate(nil, nil)
 	if err != nil {
 		return err
 	}
 	challengeRequest := tsRequest{
-		Version:    version,
+		Version:    credSSPDefaultVersion,
 		NegoTokens: []negoDataItem{{NegoToken: negoToken}},
 	}
 
@@ -435,8 +487,9 @@ func (c *ClientCredSSP) performCredSSPAuth(client *Client) error {
 		return errors.New("credssp challenge response missing NTLM challenge")
 	}
 
-	if challengeResponse.Version >= credSSPMinimumVersion && challengeResponse.Version < version {
-		version = challengeResponse.Version
+	version, err := negotiateCredSSPVersion(credSSPDefaultVersion, challengeResponse.Version, c.MinimumVersion)
+	if err != nil {
+		return err
 	}
 
 	authToken, err := ntlmClient.Authenticate(challengeResponse.NegoTokens[0].NegoToken, nil)
@@ -504,11 +557,11 @@ func (c *ClientCredSSP) performCredSSPAuth(client *Client) error {
 	}
 
 	// authInfo is the last client message; a compliant server sends no
-	// further TSRequest, so this exchange must be send-only.
+	// further TSRequest, so this exchange must be send-only. ClientNonce
+	// belongs only with pubKeyAuth, so it is omitted here.
 	if err := c.sendTSRequestNoReply(client.url, tsRequest{
-		Version:     version,
-		AuthInfo:    wrappedCredentials,
-		ClientNonce: nonce,
+		Version:  version,
+		AuthInfo: wrappedCredentials,
 	}); err != nil {
 		return err
 	}
@@ -517,6 +570,30 @@ func (c *ClientCredSSP) performCredSSPAuth(client *Client) error {
 	// and credential wrapping); CredSSP message encryption uses the TLS tunnel
 	// alone, so the ntlm client is intentionally not retained.
 	return nil
+}
+
+// negotiateCredSSPVersion clamps the client's version to what the server
+// reports, rejecting servers below the protocol floor and below any caller-
+// required minimum. requiredMinimum of 0 means only the protocol floor applies.
+func negotiateCredSSPVersion(clientVersion, serverVersion, requiredMinimum int) (int, error) {
+	if serverVersion < credSSPMinimumVersion {
+		return 0, fmt.Errorf("credssp server reported unsupported version %d", serverVersion)
+	}
+
+	negotiated := clientVersion
+	if serverVersion < negotiated {
+		negotiated = serverVersion
+	}
+
+	minimum := requiredMinimum
+	if minimum < credSSPMinimumVersion {
+		minimum = credSSPMinimumVersion
+	}
+	if negotiated < minimum {
+		return 0, fmt.Errorf("credssp negotiated version %d is below required minimum %d", negotiated, minimum)
+	}
+
+	return negotiated, nil
 }
 
 // credSSPResponseError returns an error if a server TSRequest carries a
@@ -663,12 +740,14 @@ func readTSRequest(conn net.Conn, timeout time.Duration) (*tsRequest, error) {
 		n, err := conn.Read(chunk)
 		if n > 0 {
 			buffer = append(buffer, chunk[:n]...)
-			request, asnErr := unmarshalTSRequest(buffer)
-			if asnErr == nil {
-				return request, nil
+			// Use the outer DER SEQUENCE header to decide when a whole TSRequest
+			// has arrived, rather than matching stdlib error strings.
+			complete, total, derErr := derSequenceComplete(buffer)
+			if derErr != nil {
+				return nil, derErr
 			}
-			if !isASN1TruncatedError(asnErr) {
-				return nil, asnErr
+			if complete {
+				return unmarshalTSRequest(buffer[:total])
 			}
 		}
 		if err != nil {
@@ -680,11 +759,37 @@ func readTSRequest(conn net.Conn, timeout time.Duration) (*tsRequest, error) {
 	}
 }
 
-func isASN1TruncatedError(err error) bool {
-	if err == nil {
-		return false
+// derSequenceComplete reports whether buf contains a complete DER SEQUENCE by
+// parsing its length header, returning the total length (header + content) of
+// that SEQUENCE. It returns (false, 0, nil) when more bytes are still needed.
+func derSequenceComplete(buf []byte) (bool, int, error) {
+	if len(buf) < 2 {
+		return false, 0, nil
 	}
-	return strings.Contains(err.Error(), "truncated") || strings.Contains(err.Error(), "data truncated")
+	if buf[0] != 0x30 {
+		return false, 0, fmt.Errorf("unexpected ASN.1 tag 0x%02X, want SEQUENCE", buf[0])
+	}
+
+	first := buf[1]
+	if first < 0x80 {
+		total := 2 + int(first)
+		return len(buf) >= total, total, nil
+	}
+
+	numBytes := int(first & 0x7f)
+	if numBytes == 0 || numBytes > 4 {
+		return false, 0, fmt.Errorf("invalid ASN.1 length encoding")
+	}
+	if len(buf) < 2+numBytes {
+		return false, 0, nil
+	}
+
+	contentLen := 0
+	for i := 0; i < numBytes; i++ {
+		contentLen = (contentLen << 8) | int(buf[2+i])
+	}
+	total := 2 + numBytes + contentLen
+	return len(buf) >= total, total, nil
 }
 
 func (c *ClientCredSSP) exchangeCredSSPToken(endpoint string, token []byte, requireToken bool) ([]byte, error) {

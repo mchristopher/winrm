@@ -24,7 +24,7 @@ type tsRequest struct {
 	NegoTokens  []negoDataItem `asn1:"explicit,optional,tag:1"`
 	AuthInfo    []byte         `asn1:"explicit,optional,tag:2"`
 	PubKeyAuth  []byte         `asn1:"explicit,optional,tag:3"`
-	ErrorCode   int            `asn1:"explicit,optional,tag:4"`
+	ErrorCode   int64          `asn1:"explicit,optional,tag:4"`
 	ClientNonce []byte         `asn1:"explicit,optional,tag:5"`
 }
 

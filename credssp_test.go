@@ -9,6 +9,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/binary"
+	"encoding/pem"
 	"errors"
 	"io"
 	"math/big"
@@ -335,14 +336,120 @@ func (s *WinRMSuite) TestCredSSPResponseErrorCode(c *C) {
 	c.Assert(credSSPResponseError(nil), IsNil)
 	c.Assert(credSSPResponseError(&tsRequest{Version: credSSPDefaultVersion}), IsNil)
 
-	encoded, err := marshalTSRequest(tsRequest{Version: credSSPDefaultVersion, ErrorCode: 0x05})
+	// Use a real NTSTATUS whose high bit is set; this must round-trip through
+	// ASN.1 (int64) on any platform, including 32-bit.
+	encoded, err := marshalTSRequest(tsRequest{Version: credSSPDefaultVersion, ErrorCode: 0xC000006A})
 	c.Assert(err, IsNil)
 	decoded, err := unmarshalTSRequest(encoded)
 	c.Assert(err, IsNil)
 
 	err = credSSPResponseError(decoded)
 	c.Assert(err, NotNil)
-	c.Assert(err.Error(), Contains, "0x00000005")
+	c.Assert(err.Error(), Contains, "0xC000006A")
+}
+
+// TestNegotiateCredSSPVersion guards the version floor and the CVE-2018-0886
+// minimum-version knob.
+func (s *WinRMSuite) TestNegotiateCredSSPVersion(c *C) {
+	v, err := negotiateCredSSPVersion(6, 8, 0)
+	c.Assert(err, IsNil)
+	c.Assert(v, Equals, 6)
+
+	v, err = negotiateCredSSPVersion(6, 3, 0)
+	c.Assert(err, IsNil)
+	c.Assert(v, Equals, 3)
+
+	_, err = negotiateCredSSPVersion(6, 1, 0)
+	c.Assert(err, NotNil)
+
+	_, err = negotiateCredSSPVersion(6, 0, 0)
+	c.Assert(err, NotNil)
+
+	// Caller requires 5+, server offers 3 -> rejected downgrade.
+	_, err = negotiateCredSSPVersion(6, 3, 5)
+	c.Assert(err, NotNil)
+
+	v, err = negotiateCredSSPVersion(6, 6, 5)
+	c.Assert(err, IsNil)
+	c.Assert(v, Equals, 6)
+}
+
+// TestDERSequenceComplete guards the DER-length-based framing used to decide a
+// full TSRequest has arrived.
+func (s *WinRMSuite) TestDERSequenceComplete(c *C) {
+	encoded, err := marshalTSRequest(tsRequest{
+		Version:    credSSPDefaultVersion,
+		NegoTokens: []negoDataItem{{NegoToken: bytes.Repeat([]byte{0x41}, 300)}},
+	})
+	c.Assert(err, IsNil)
+
+	done, _, err := derSequenceComplete(encoded[:4])
+	c.Assert(err, IsNil)
+	c.Assert(done, Equals, false)
+
+	done, total, err := derSequenceComplete(encoded)
+	c.Assert(err, IsNil)
+	c.Assert(done, Equals, true)
+	c.Assert(total, Equals, len(encoded))
+
+	// Trailing bytes beyond the SEQUENCE are not counted in its length.
+	done, total, err = derSequenceComplete(append(append([]byte(nil), encoded...), 0xFF, 0xFF))
+	c.Assert(err, IsNil)
+	c.Assert(done, Equals, true)
+	c.Assert(total, Equals, len(encoded))
+
+	_, _, err = derSequenceComplete([]byte{0x02, 0x01, 0x05})
+	c.Assert(err, NotNil)
+}
+
+// TestCredSSPTLSConfig guards the CA/ServerName handling.
+func (s *WinRMSuite) TestCredSSPTLSConfig(c *C) {
+	// Bad CA bytes surface an error instead of being swallowed.
+	badClient := &ClientCredSSP{endpoint: &Endpoint{Host: "winhost", CACert: []byte("-----BEGIN CERTIFICATE-----\nnope\n-----END CERTIFICATE-----")}}
+	_, err := badClient.tlsConfig()
+	c.Assert(err, NotNil)
+
+	// Valid CA, verifying, no explicit ServerName -> defaults to the host.
+	certificate, err := generateCredSSPTestCertificate()
+	c.Assert(err, IsNil)
+	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificate.Certificate[0]})
+
+	verifying := &ClientCredSSP{endpoint: &Endpoint{Host: "winhost", CACert: caPEM, Insecure: false}}
+	cfg, err := verifying.tlsConfig()
+	c.Assert(err, IsNil)
+	c.Assert(cfg.InsecureSkipVerify, Equals, false)
+	c.Assert(cfg.ServerName, Equals, "winhost")
+	c.Assert(cfg.RootCAs, NotNil)
+
+	// No CA and not explicitly insecure -> nothing to verify, so skip.
+	noCA := &ClientCredSSP{endpoint: &Endpoint{Host: "winhost", Insecure: false}}
+	cfg, err = noCA.tlsConfig()
+	c.Assert(err, IsNil)
+	c.Assert(cfg.InsecureSkipVerify, Equals, true)
+}
+
+// TestCredSSPReauthRequiredOn401 guards that a 401 on an encrypted request is
+// surfaced as the re-auth sentinel so Post can re-handshake.
+func (s *WinRMSuite) TestCredSSPReauthRequiredOn401(c *C) {
+	clientConn, _, err := newCredSSPTLSHarness()
+	c.Assert(err, IsNil)
+
+	ts, _, _, err := StartTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	c.Assert(err, IsNil)
+	defer ts.Close()
+
+	encryption, err := NewEncryption("credssp")
+	c.Assert(err, IsNil)
+	encryption.httpClient = &http.Client{}
+	encryption.tlsConn = clientConn.tlsConn
+	encryption.credsspConn = clientConn.memConn
+	encryption.timeout = 5 * time.Second
+
+	_, err = encryption.PrepareEncryptedRequest(&Client{}, ts.URL, []byte("<soap/>"))
+	c.Assert(errors.Is(err, errCredSSPReauthRequired), Equals, true)
 }
 
 // TestCredSSPEncryptMessagePropagatesError ensures a tunnel failure during

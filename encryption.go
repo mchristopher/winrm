@@ -201,6 +201,15 @@ func (e *Encryption) PrepareEncryptedRequest(client *Client, endpoint string, me
 		return "", fmt.Errorf("unknown error %w", err)
 	}
 
+	// A 401 on an encrypted CredSSP request means the connection is no longer
+	// authenticated (typically re-dialed after the server dropped the pinned
+	// socket). Signal the transport to re-run the handshake.
+	if e.protocol == "credssp" && resp.StatusCode == http.StatusUnauthorized {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		return "", errCredSSPReauthRequired
+	}
+
 	body, err := e.ParseEncryptedResponse(resp)
 
 	return string(body), err
