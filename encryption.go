@@ -70,6 +70,10 @@ func NewEncryption(protocol string) (*Encryption, error) {
 	case "credssp":
 		encryption.protocolString = []byte("application/HTTP-CredSSP-session-encrypted")
 		return encryption, nil
+		/* kerberos is currently unimplemented, leave holder for future to keep in sync with python implementation
+		case "kerberos": // kerberos is currently unimplemented, leave holder for future to keep in sync with python implementation
+				encryption.protocolString = []byte("application/HTTP-SPNEGO-session-encrypted")
+		*/
 	}
 
 	return nil, fmt.Errorf("Encryption for protocol '%s' not supported", protocol)
@@ -289,6 +293,8 @@ func (e *Encryption) decryptMessage(encryptedData []byte, host string) ([]byte, 
 		return e.decryptNtlmMessage(encryptedData, host)
 	case "credssp":
 		return e.decryptCredsspMessage(encryptedData, host)
+	case "kerberos":
+		return e.decryptKerberosMessage(encryptedData, host)
 	default:
 		return nil, errors.New("Encryption for protocol " + e.protocol + " not supported")
 	}
@@ -307,8 +313,6 @@ func (e *Encryption) decryptNtlmMessage(encryptedData []byte, host string) ([]by
 }
 
 func (e *Encryption) decryptCredsspMessage(encryptedData []byte, host string) ([]byte, error) {
-	_ = host
-
 	if e.tlsConn == nil || e.credsspConn == nil {
 		return nil, errors.New("credssp tls context not initialized")
 	}
@@ -340,8 +344,6 @@ func (e *Encryption) decryptCredsspMessage(encryptedData []byte, host string) ([
 }
 
 func (enc *Encryption) decryptKerberosMessage(encryptedData []byte, host string) ([]byte, error) {
-	_ = encryptedData
-	_ = host
 	// //TODO
 	// signatureLength := binary.LittleEndian.Uint32(encryptedData[0:4])
 	// signature := encryptedData[4 : 4+signatureLength]
@@ -355,12 +357,15 @@ func (enc *Encryption) decryptKerberosMessage(encryptedData []byte, host string)
 	// return message, nil
 	return nil, errors.New("kerberos encryption is not implemented")
 }
+
 func (e *Encryption) buildMessage(encryptedData []byte, host string) ([]byte, error) {
 	switch e.protocol {
 	case "ntlm":
 		return e.buildNTLMMessage(encryptedData, host)
 	case "credssp":
 		return e.buildCredSSPMessage(encryptedData, host)
+	case "kerberos":
+		return e.buildKerberosMessage(encryptedData, host)
 	default:
 		return nil, errors.New("Encryption for protocol " + e.protocol + " not supported")
 	}
@@ -387,8 +392,6 @@ func (enc *Encryption) buildNTLMMessage(message []byte, host string) ([]byte, er
 }
 
 func (e *Encryption) buildCredSSPMessage(message []byte, host string) ([]byte, error) {
-	_ = host
-
 	if e.tlsConn == nil || e.credsspConn == nil {
 		return nil, errors.New("credssp tls context not initialized")
 	}
@@ -412,8 +415,6 @@ func (e *Encryption) buildCredSSPMessage(message []byte, host string) ([]byte, e
 }
 
 func (e *Encryption) buildKerberosMessage(message []byte, host string) ([]byte, error) {
-	_ = message
-	_ = host
 	// //TODO
 	// sealedMessage, signature := e.session.Auth.WrapWinrm(host, message)
 
@@ -436,17 +437,18 @@ func (e *Encryption) getCredSSPTrailerLength(messageLength int, cipherSuite stri
 		} else if strings.Contains(cipherSuite, "-") {
 			hashAlgorithm = cipherSuite[strings.LastIndex(cipherSuite, "-")+1:]
 		}
-		var hashLength int
 
-		if hashAlgorithm == "MD5" {
+		var hashLength int
+		switch hashAlgorithm {
+		case "MD5":
 			hashLength = 16
-		} else if hashAlgorithm == "SHA" {
+		case "SHA":
 			hashLength = 20
-		} else if hashAlgorithm == "SHA256" {
+		case "SHA256":
 			hashLength = 32
-		} else if hashAlgorithm == "SHA384" {
+		case "SHA384":
 			hashLength = 48
-		} else {
+		default:
 			hashLength = 0
 		}
 
