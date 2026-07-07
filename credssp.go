@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -61,6 +62,9 @@ type credSSPMemoryConn struct {
 	incoming chan []byte
 	outgoing chan []byte
 	closeCh  chan struct{}
+
+	deadlineMu   sync.Mutex
+	readDeadline time.Time
 }
 
 func newCredSSPMemoryConn() *credSSPMemoryConn {
@@ -81,8 +85,27 @@ func (c *credSSPMemoryConn) Read(p []byte) (int, error) {
 		}
 		c.readMu.Unlock()
 
+		// Honor the read deadline so a truncated server flight cannot block
+		// Read (and therefore readTSRequest / io.ReadFull) indefinitely.
+		var timeout <-chan time.Time
+		var timer *time.Timer
+		c.deadlineMu.Lock()
+		deadline := c.readDeadline
+		c.deadlineMu.Unlock()
+		if !deadline.IsZero() {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				return 0, os.ErrDeadlineExceeded
+			}
+			timer = time.NewTimer(remaining)
+			timeout = timer.C
+		}
+
 		select {
 		case data, ok := <-c.incoming:
+			if timer != nil {
+				timer.Stop()
+			}
 			if !ok {
 				return 0, io.EOF
 			}
@@ -90,7 +113,12 @@ func (c *credSSPMemoryConn) Read(p []byte) (int, error) {
 			c.readBuf.Write(data)
 			c.readMu.Unlock()
 		case <-c.closeCh:
+			if timer != nil {
+				timer.Stop()
+			}
 			return 0, io.EOF
+		case <-timeout:
+			return 0, os.ErrDeadlineExceeded
 		}
 	}
 }
@@ -125,15 +153,20 @@ func (c *credSSPMemoryConn) RemoteAddr() net.Addr {
 	return dummyAddr("remote")
 }
 
-func (c *credSSPMemoryConn) SetDeadline(_ time.Time) error {
-	return nil
+func (c *credSSPMemoryConn) SetDeadline(t time.Time) error {
+	return c.SetReadDeadline(t)
 }
 
-func (c *credSSPMemoryConn) SetReadDeadline(_ time.Time) error {
+func (c *credSSPMemoryConn) SetReadDeadline(t time.Time) error {
+	c.deadlineMu.Lock()
+	c.readDeadline = t
+	c.deadlineMu.Unlock()
 	return nil
 }
 
 func (c *credSSPMemoryConn) SetWriteDeadline(_ time.Time) error {
+	// Writes go to a buffered channel and never block meaningfully, so there is
+	// no write deadline to honor.
 	return nil
 }
 
@@ -216,7 +249,6 @@ type ClientCredSSP struct {
 	endpoint   *Endpoint
 	memConn    *credSSPMemoryConn
 	tlsConn    *tls.Conn
-	ntlmClient *ntlmssp.Client
 	encryption *Encryption
 
 	handshakeComplete bool
@@ -293,7 +325,6 @@ func (c *ClientCredSSP) Post(client *Client, request *soap.SoapMessage) (string,
 		encryption.httpClient = c.httpClient
 		encryption.tlsConn = c.tlsConn
 		encryption.credsspConn = c.memConn
-		encryption.ntlmClient = c.ntlmClient
 		encryption.timeout = credSSPTimeout(c.endpoint.Timeout)
 		c.encryption = encryption
 	}
@@ -482,7 +513,9 @@ func (c *ClientCredSSP) performCredSSPAuth(client *Client) error {
 		return err
 	}
 
-	c.ntlmClient = ntlmClient
+	// The NTLM session is only needed during the handshake (pubKeyAuth binding
+	// and credential wrapping); CredSSP message encryption uses the TLS tunnel
+	// alone, so the ntlm client is intentionally not retained.
 	return nil
 }
 
@@ -681,6 +714,12 @@ func (c *ClientCredSSP) exchangeCredSSPToken(endpoint string, token []byte, requ
 		return nil, err
 	}
 	if !found {
+		// Surface a real HTTP failure (e.g. 500) rather than masking it as a
+		// missing-token error. A token can legitimately accompany a 401 during
+		// negotiation, so only treat a tokenless error status as a failure.
+		if resp.StatusCode >= http.StatusBadRequest {
+			return nil, fmt.Errorf("credssp exchange failed: HTTP %d", resp.StatusCode)
+		}
 		if requireToken {
 			return nil, fmt.Errorf("credssp server did not return %s token", credSSPHeaderName)
 		}

@@ -86,10 +86,8 @@ func (e *Encryption) Transport(endpoint *Endpoint) error {
 }
 
 func (e *Encryption) Post(client *Client, message *soap.SoapMessage) (string, error) {
-	if e.protocol == "credssp" {
-		return e.PrepareEncryptedRequest(client, client.url, []byte(message.String()))
-	}
-
+	// Note: CredSSP does not use this path. ClientCredSSP.Post drives the
+	// handshake and calls PrepareEncryptedRequest directly.
 	userName, domain := splitUsername(client.username)
 	e.ntlmClient, _ = ntlmssp.NewClient(ntlmssp.SetUserInfo(userName, client.password), ntlmssp.SetDomain(domain), ntlmssp.SetVersion(ntlmssp.DefaultVersion()))
 	e.ntlmhttp, _ = ntlmhttp.NewClient(e.httpClient, e.ntlmClient)

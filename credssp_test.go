@@ -13,6 +13,7 @@ import (
 	"io"
 	"math/big"
 	"net/http"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -353,6 +354,84 @@ func (s *WinRMSuite) TestCredSSPEncryptMessagePropagatesError(c *C) {
 	// tlsConn/credsspConn are unset, so buildCredSSPMessage fails.
 	_, err = encryption.encryptMessage([]byte("payload"), "host")
 	c.Assert(err, NotNil)
+}
+
+// TestCredSSPMemoryConnReadDeadline ensures the read deadline is honored so a
+// starved Read returns instead of blocking forever.
+func TestCredSSPMemoryConnReadDeadline(t *testing.T) {
+	conn := newCredSSPMemoryConn()
+	defer conn.Close()
+
+	if err := conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+
+	buf := make([]byte, 8)
+	_, err := conn.Read(buf)
+	if !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("expected deadline error, got %v", err)
+	}
+}
+
+// TestCredSSPDecryptTimesOutOnTruncatedResponse guards that a server response
+// shorter than the declared length times out instead of hanging (the read
+// deadline must actually take effect through the TLS tunnel).
+func (s *WinRMSuite) TestCredSSPDecryptTimesOutOnTruncatedResponse(c *C) {
+	clientConn, serverConn, err := newCredSSPTLSHarness()
+	c.Assert(err, IsNil)
+
+	encryption, err := NewEncryption("credssp")
+	c.Assert(err, IsNil)
+	encryption.tlsConn = clientConn.tlsConn
+	encryption.credsspConn = clientConn.memConn
+	encryption.timeout = 200 * time.Millisecond
+
+	response := []byte("short")
+	_, err = serverConn.tlsConn.Write(response)
+	c.Assert(err, IsNil)
+	sealedFirst, err := serverConn.memConn.popOutgoing(5 * time.Second)
+	c.Assert(err, IsNil)
+	sealed := serverConn.memConn.drainOutgoing(sealedFirst)
+
+	cipherName := tls.CipherSuiteName(clientConn.tlsConn.ConnectionState().CipherSuite)
+	trailer := encryption.getCredSSPTrailerLength(len(response), cipherName)
+	payload := make([]byte, 4+len(sealed))
+	binary.LittleEndian.PutUint32(payload[:4], uint32(trailer))
+	copy(payload[4:], sealed)
+
+	start := time.Now()
+	// Declare more plaintext than was actually sent.
+	_, err = encryption.decryptCredsspMessage(payload, "host", len(response)+64)
+	c.Assert(err, NotNil)
+	c.Assert(time.Since(start) < 5*time.Second, Equals, true)
+}
+
+// TestCredSSPExchangeSurfacesHTTPError guards that an error HTTP status is
+// reported instead of a vague missing-token message.
+func (s *WinRMSuite) TestCredSSPExchangeSurfacesHTTPError(c *C) {
+	clientConn, _, err := newCredSSPTLSHarness()
+	c.Assert(err, IsNil)
+
+	ts, _, _, err := StartTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	c.Assert(err, IsNil)
+	defer ts.Close()
+
+	client := &ClientCredSSP{
+		httpClient: &http.Client{},
+		endpoint:   &Endpoint{Timeout: 5 * time.Second},
+		tlsConn:    clientConn.tlsConn,
+		memConn:    clientConn.memConn,
+	}
+
+	_, err = client.sendTSRequest(ts.URL, tsRequest{
+		Version:    credSSPDefaultVersion,
+		NegoTokens: []negoDataItem{{NegoToken: []byte("token")}},
+	})
+	c.Assert(err, NotNil)
+	c.Assert(err.Error(), Contains, "HTTP 500")
 }
 
 // TestCredSSPMemoryConnCloseRace guards finding 7: Close must not race with
