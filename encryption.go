@@ -2,6 +2,7 @@ package winrm
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/bodgit/ntlmssp"
 	ntlmhttp "github.com/bodgit/ntlmssp/http"
@@ -23,6 +25,8 @@ type Encryption struct {
 	httpClient     *http.Client
 	ntlmClient     *ntlmssp.Client
 	ntlmhttp       *ntlmhttp.Client
+	tlsConn        *tls.Conn
+	credsspConn    *credSSPMemoryConn
 }
 
 const (
@@ -63,12 +67,9 @@ func NewEncryption(protocol string) (*Encryption, error) {
 	case "ntlm":
 		encryption.protocolString = []byte("application/HTTP-SPNEGO-session-encrypted")
 		return encryption, nil
-		/* credssp and kerberos is currently unimplemented, leave holder for future to keep in sync with python implementation
-		case "credssp":
-			encryption.protocolString = []byte("application/HTTP-CredSSP-session-encrypted")
-		case "kerberos": // kerberos is currently unimplemented, leave holder for future to keep in sync with python implementation
-			encryption.protocolString = []byte("application/HTTP-SPNEGO-session-encrypted")
-		*/
+	case "credssp":
+		encryption.protocolString = []byte("application/HTTP-CredSSP-session-encrypted")
+		return encryption, nil
 	}
 
 	return nil, fmt.Errorf("Encryption for protocol '%s' not supported", protocol)
@@ -80,19 +81,11 @@ func (e *Encryption) Transport(endpoint *Endpoint) error {
 }
 
 func (e *Encryption) Post(client *Client, message *soap.SoapMessage) (string, error) {
-	var userName, domain string
-	if strings.Contains(client.username, "@") {
-		parts := strings.Split(client.username, "@")
-		domain = parts[1]
-		userName = parts[0]
-	} else if strings.Contains(client.username, "\\") {
-		parts := strings.Split(client.username, "\\")
-		domain = parts[0]
-		userName = parts[1]
-	} else {
-		userName = client.username
+	if e.protocol == "credssp" {
+		return e.PrepareEncryptedRequest(client, client.url, []byte(message.String()))
 	}
 
+	userName, domain := splitUsername(client.username)
 	e.ntlmClient, _ = ntlmssp.NewClient(ntlmssp.SetUserInfo(userName, client.password), ntlmssp.SetDomain(domain), ntlmssp.SetVersion(ntlmssp.DefaultVersion()))
 	e.ntlmhttp, _ = ntlmhttp.NewClient(e.httpClient, e.ntlmClient)
 
@@ -158,7 +151,11 @@ func (e *Encryption) PrepareEncryptedRequest(client *Client, endpoint string, me
 		encrypted_message = []byte{}
 		message_chunks := [][]byte{}
 		for i := 0; i < len(message); i += sixTenKB {
-			message_chunks = append(message_chunks, message[i:i+sixTenKB])
+			end := i + sixTenKB
+			if end > len(message) {
+				end = len(message)
+			}
+			message_chunks = append(message_chunks, message[i:end])
 		}
 		for _, message_chunk := range message_chunks {
 			encrypted_chunk := e.encryptMessage(message_chunk, host)
@@ -182,7 +179,15 @@ func (e *Encryption) PrepareEncryptedRequest(client *Client, endpoint string, me
 	req.Header.Set("Content-Length", fmt.Sprintf("%d", len(encrypted_message)))
 	req.Header.Set("Content-Type", fmt.Sprintf(`%s;protocol="%s";boundary="Encrypted Boundary"`, content_type, e.protocolString))
 
-	resp, err := e.ntlmhttp.Do(req)
+	var resp *http.Response
+	switch e.protocol {
+	case "ntlm":
+		resp, err = e.ntlmhttp.Do(req)
+	case "credssp":
+		resp, err = e.httpClient.Do(req)
+	default:
+		return "", errors.New("Encryption for protocol " + e.protocol + " not supported")
+	}
 	if err != nil {
 		return "", fmt.Errorf("unknown error %w", err)
 	}
@@ -282,12 +287,8 @@ func (e *Encryption) decryptMessage(encryptedData []byte, host string) ([]byte, 
 	switch e.protocol {
 	case "ntlm":
 		return e.decryptNtlmMessage(encryptedData, host)
-		/* credssp and kerberos is currently unimplemented, leave holder for future to keep in sync with python implementation
-		case "credssp":
-			return e.decryptCredsspMessage(encryptedData, host)
-		case "kerberos":
-			return e.decryptKerberosMessage(encryptedData, host)
-		*/
+	case "credssp":
+		return e.decryptCredsspMessage(encryptedData, host)
 	default:
 		return nil, errors.New("Encryption for protocol " + e.protocol + " not supported")
 	}
@@ -305,24 +306,42 @@ func (e *Encryption) decryptNtlmMessage(encryptedData []byte, host string) ([]by
 	return message, nil
 }
 
-/* credssp and kerberos is currently unimplemented, leave holder for future to keep in sync with python implementation
 func (e *Encryption) decryptCredsspMessage(encryptedData []byte, host string) ([]byte, error) {
-	// // TODO
-	// encryptedMessage := encryptedData[4:]
+	_ = host
 
-	// credsspContext, ok := e.session.Auth.Contexts()[host]
-	// if !ok {
-	// 	return nil, fmt.Errorf("credssp context not found for host: %s", host)
-	// }
+	if e.tlsConn == nil || e.credsspConn == nil {
+		return nil, errors.New("credssp tls context not initialized")
+	}
+	if len(encryptedData) < 4 {
+		return nil, errors.New("credssp encrypted payload too short")
+	}
 
-	// message, err := credsspContext.Unwrap(encryptedMessage)
-	// if err != nil {
-	// 	return nil, err
-	// }
-	// return message, nil
+	trailerLength := int(binary.LittleEndian.Uint32(encryptedData[:4]))
+	sealed := encryptedData[4:]
+	if err := e.credsspConn.pushIncoming(sealed); err != nil {
+		return nil, err
+	}
+
+	expectedLength := len(sealed) - trailerLength
+	if expectedLength <= 0 {
+		expectedLength = len(sealed)
+	}
+
+	_ = e.tlsConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	defer e.tlsConn.SetReadDeadline(time.Time{})
+
+	message := make([]byte, expectedLength)
+	n, err := e.tlsConn.Read(message)
+	if err != nil {
+		return nil, err
+	}
+
+	return message[:n], nil
 }
 
 func (enc *Encryption) decryptKerberosMessage(encryptedData []byte, host string) ([]byte, error) {
+	_ = encryptedData
+	_ = host
 	// //TODO
 	// signatureLength := binary.LittleEndian.Uint32(encryptedData[0:4])
 	// signature := encryptedData[4 : 4+signatureLength]
@@ -334,19 +353,14 @@ func (enc *Encryption) decryptKerberosMessage(encryptedData []byte, host string)
 	// }
 
 	// return message, nil
+	return nil, errors.New("kerberos encryption is not implemented")
 }
-*/
-
 func (e *Encryption) buildMessage(encryptedData []byte, host string) ([]byte, error) {
 	switch e.protocol {
 	case "ntlm":
 		return e.buildNTLMMessage(encryptedData, host)
-		/* credssp and kerberos is currently unimplemented, leave holder for future to keep in sync with python implementation
-		case "credssp":
-			return e.buildCredSSPMessage(encryptedData, host)
-		case "kerberos":
-			return e.buildKerberosMessage(encryptedData, host)
-		*/
+	case "credssp":
+		return e.buildCredSSPMessage(encryptedData, host)
 	default:
 		return nil, errors.New("Encryption for protocol " + e.protocol + " not supported")
 	}
@@ -372,22 +386,34 @@ func (enc *Encryption) buildNTLMMessage(message []byte, host string) ([]byte, er
 	return buf.Bytes(), nil
 }
 
-/* credssp and kerberos is currently unimplemented, leave holder for future to keep in sync with python implementation
 func (e *Encryption) buildCredSSPMessage(message []byte, host string) ([]byte, error) {
-	// //TODO
-	// context := e.session.Auth.Contexts[host]
-	// sealedMessage := context.Wrap(message)
+	_ = host
 
-	// cipherNegotiated := context.TLSConnection.ConnectionState().CipherSuite.Name
-	// trailerLength := e.getCredSSPTrailerLength(len(message), cipherNegotiated)
+	if e.tlsConn == nil || e.credsspConn == nil {
+		return nil, errors.New("credssp tls context not initialized")
+	}
 
-	// trailer := make([]byte, 4)
-	// binary.LittleEndian.PutUint32(trailer, uint32(trailerLength))
+	if _, err := e.tlsConn.Write(message); err != nil {
+		return nil, err
+	}
+	sealedFirst, err := e.credsspConn.popOutgoing(5 * time.Second)
+	if err != nil {
+		return nil, err
+	}
+	sealedMessage := e.credsspConn.drainOutgoing(sealedFirst)
 
-	// return append(trailer, sealedMessage...), nil
+	cipherSuite := tls.CipherSuiteName(e.tlsConn.ConnectionState().CipherSuite)
+	trailerLength := e.getCredSSPTrailerLength(len(message), cipherSuite)
+
+	trailer := make([]byte, 4)
+	binary.LittleEndian.PutUint32(trailer, uint32(trailerLength))
+
+	return append(trailer, sealedMessage...), nil
 }
 
 func (e *Encryption) buildKerberosMessage(message []byte, host string) ([]byte, error) {
+	_ = message
+	_ = host
 	// //TODO
 	// sealedMessage, signature := e.session.Auth.WrapWinrm(host, message)
 
@@ -395,15 +421,21 @@ func (e *Encryption) buildKerberosMessage(message []byte, host string) ([]byte, 
 	// binary.LittleEndian.PutUint32(signatureLength, uint32(len(signature)))
 
 	// return append(append(signatureLength, signature...), sealedMessage...), nil
+	return nil, errors.New("kerberos encryption is not implemented")
 }
 
 func (e *Encryption) getCredSSPTrailerLength(messageLength int, cipherSuite string) int {
 	var trailerLength int
 
-	if match, _ := regexp.MatchString("^.*-GCM-[\\w\\d]*$", cipherSuite); match {
+	if strings.Contains(cipherSuite, "_GCM_") || strings.Contains(cipherSuite, "-GCM-") {
 		trailerLength = 16
 	} else {
-		hashAlgorithm := cipherSuite[strings.LastIndex(cipherSuite, "-")+1:]
+		hashAlgorithm := ""
+		if strings.Contains(cipherSuite, "_") {
+			hashAlgorithm = cipherSuite[strings.LastIndex(cipherSuite, "_")+1:]
+		} else if strings.Contains(cipherSuite, "-") {
+			hashAlgorithm = cipherSuite[strings.LastIndex(cipherSuite, "-")+1:]
+		}
 		var hashLength int
 
 		if hashAlgorithm == "MD5" {
@@ -421,18 +453,23 @@ func (e *Encryption) getCredSSPTrailerLength(messageLength int, cipherSuite stri
 		prePadLength := messageLength + hashLength
 		paddingLength := 0
 
-		if strings.Contains(cipherSuite, "RC4") {
+		if strings.Contains(cipherSuite, "RC4") || strings.Contains(cipherSuite, "CHACHA20") {
 			paddingLength = 0
-		} else if strings.Contains(cipherSuite, "DES") || strings.Contains(cipherSuite, "3DES") {
+		} else if strings.Contains(cipherSuite, "3DES") || strings.Contains(cipherSuite, "DES") {
 			paddingLength = 8 - (prePadLength % 8)
+			if paddingLength == 8 {
+				paddingLength = 0
+			}
 
 		} else {
 			// AES is a 128 bit block cipher
 			paddingLength = 16 - (prePadLength % 16)
+			if paddingLength == 16 {
+				paddingLength = 0
+			}
 		}
 
 		trailerLength = (prePadLength + paddingLength) - messageLength
 	}
 	return trailerLength
 }
-*/
