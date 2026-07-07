@@ -1,6 +1,7 @@
 package winrm
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -9,8 +10,10 @@ import (
 	"encoding/asn1"
 	"encoding/binary"
 	"errors"
+	"io"
 	"math/big"
 	"net/http"
+	"sync"
 	"testing"
 	"time"
 
@@ -87,6 +90,7 @@ func (s *WinRMSuite) TestCredSSPBuildDecryptRoundTrip(c *C) {
 	c.Assert(err, IsNil)
 	encryption.tlsConn = clientConn.tlsConn
 	encryption.credsspConn = clientConn.memConn
+	encryption.timeout = 5 * time.Second
 
 	request := []byte("create shell request")
 	wrappedRequest, err := encryption.buildCredSSPMessage(request, "host")
@@ -114,9 +118,236 @@ func (s *WinRMSuite) TestCredSSPBuildDecryptRoundTrip(c *C) {
 	binary.LittleEndian.PutUint32(payload[:4], uint32(trailer))
 	copy(payload[4:], serverCiphertext)
 
-	decrypted, err := encryption.decryptCredsspMessage(payload, "host")
+	decrypted, err := encryption.decryptCredsspMessage(payload, "host", len(response))
 	c.Assert(err, IsNil)
 	c.Assert(decrypted, DeepEquals, response)
+}
+
+// fakeSecurityContext is a reversible stand-in for *ntlmssp.SecuritySession so
+// the CredSSP wire framing can be asserted without a full NTLM handshake.
+type fakeSecurityContext struct {
+	signature []byte
+}
+
+func (f *fakeSecurityContext) Wrap(b []byte) ([]byte, []byte, error) {
+	sealed := make([]byte, len(b))
+	for i := range b {
+		sealed[i] = b[i] ^ 0xAA
+	}
+	return sealed, append([]byte(nil), f.signature...), nil
+}
+
+func (f *fakeSecurityContext) Unwrap(b, signature []byte) ([]byte, error) {
+	if !bytes.Equal(signature, f.signature) {
+		return nil, errors.New("signature mismatch")
+	}
+	out := make([]byte, len(b))
+	for i := range b {
+		out[i] = b[i] ^ 0xAA
+	}
+	return out, nil
+}
+
+// TestCredSSPWrapWireFormat guards the MS-CSSP framing: signature (16 bytes)
+// immediately followed by sealed data, with no 4-byte length prefix.
+func (s *WinRMSuite) TestCredSSPWrapWireFormat(c *C) {
+	signature := bytes.Repeat([]byte{0x11}, ntlmSignatureLength)
+	ctx := &fakeSecurityContext{signature: signature}
+	payload := []byte("public-key-info-payload")
+
+	wrapped, err := wrapCredSSPData(ctx, payload)
+	c.Assert(err, IsNil)
+
+	// No length prefix: exactly signature + sealed, and RC4-style sealing keeps
+	// the sealed length equal to the plaintext length.
+	c.Assert(len(wrapped), Equals, ntlmSignatureLength+len(payload))
+	c.Assert(wrapped[:ntlmSignatureLength], DeepEquals, signature)
+
+	expectedSealed := make([]byte, len(payload))
+	for i := range payload {
+		expectedSealed[i] = payload[i] ^ 0xAA
+	}
+	c.Assert(wrapped[ntlmSignatureLength:], DeepEquals, expectedSealed)
+
+	// The signature must be at the very front; a stray length prefix would put
+	// the first signature byte at offset 4 instead of 0.
+	c.Assert(wrapped[0], Equals, byte(0x11))
+
+	out, err := unwrapCredSSPData(ctx, wrapped)
+	c.Assert(err, IsNil)
+	c.Assert(out, DeepEquals, payload)
+}
+
+func (s *WinRMSuite) TestCredSSPUnwrapRejectsShortPayload(c *C) {
+	ctx := &fakeSecurityContext{signature: bytes.Repeat([]byte{0x11}, ntlmSignatureLength)}
+	_, err := unwrapCredSSPData(ctx, []byte{0x00, 0x01, 0x02})
+	c.Assert(err, NotNil)
+}
+
+// TestCredSSPPubKeyAuthDirection guards the v2-v4 vs v5+ pubKeyAuth direction:
+// pre-v5 the client sends the key unmodified and expects it back +1; v5+ uses
+// distinct directional SHA-256 binding hashes.
+func (s *WinRMSuite) TestCredSSPPubKeyAuthDirection(c *C) {
+	pubKey := []byte{0x30, 0x82, 0x01, 0x0a, 0x02, 0x82}
+
+	clientPlain, expected := computePubKeyAuthPlaintext(4, nil, pubKey)
+	c.Assert(clientPlain, DeepEquals, pubKey)
+
+	wantExpected := append([]byte(nil), pubKey...)
+	wantExpected[0]++
+	c.Assert(expected, DeepEquals, wantExpected)
+	// The input key must not be mutated in place.
+	c.Assert(pubKey[0], Equals, byte(0x30))
+
+	nonce := bytes.Repeat([]byte{0x07}, 32)
+	clientHash, serverHash := computePubKeyAuthPlaintext(credSSPDefaultVersion, nonce, pubKey)
+	c.Assert(len(clientHash), Equals, 32)
+	c.Assert(len(serverHash), Equals, 32)
+	c.Assert(bytes.Equal(clientHash, serverHash), Equals, false)
+	c.Assert(clientHash, DeepEquals, credSSPBindingHash(credSSPClientBindingLabel, nonce, pubKey))
+	c.Assert(serverHash, DeepEquals, credSSPBindingHash(credSSPServerBindingLabel, nonce, pubKey))
+}
+
+// TestCredSSPDecryptSpansMultipleRecords guards decrypting a chunk whose
+// plaintext spans several TLS records (finding: a single Read returns short).
+func (s *WinRMSuite) TestCredSSPDecryptSpansMultipleRecords(c *C) {
+	clientConn, serverConn, err := newCredSSPTLSHarness()
+	c.Assert(err, IsNil)
+
+	encryption, err := NewEncryption("credssp")
+	c.Assert(err, IsNil)
+	encryption.tlsConn = clientConn.tlsConn
+	encryption.credsspConn = clientConn.memConn
+	encryption.timeout = 5 * time.Second
+
+	// Larger than a single 16 KB TLS record to force multiple records.
+	response := bytes.Repeat([]byte("ABCDEFGH"), 5000)
+	_, err = serverConn.tlsConn.Write(response)
+	c.Assert(err, IsNil)
+
+	sealedFirst, err := serverConn.memConn.popOutgoing(5 * time.Second)
+	c.Assert(err, IsNil)
+	sealed := serverConn.memConn.drainOutgoing(sealedFirst)
+
+	cipherName := tls.CipherSuiteName(clientConn.tlsConn.ConnectionState().CipherSuite)
+	trailer := encryption.getCredSSPTrailerLength(len(response), cipherName)
+	payload := make([]byte, 4+len(sealed))
+	binary.LittleEndian.PutUint32(payload[:4], uint32(trailer))
+	copy(payload[4:], sealed)
+
+	decrypted, err := encryption.decryptCredsspMessage(payload, "host", len(response))
+	c.Assert(err, IsNil)
+	c.Assert(decrypted, DeepEquals, response)
+}
+
+// TestCredSSPDecryptTamperedFails ensures a modified ciphertext is rejected by
+// the TLS integrity layer rather than returning corrupt plaintext.
+func (s *WinRMSuite) TestCredSSPDecryptTamperedFails(c *C) {
+	clientConn, serverConn, err := newCredSSPTLSHarness()
+	c.Assert(err, IsNil)
+
+	encryption, err := NewEncryption("credssp")
+	c.Assert(err, IsNil)
+	encryption.tlsConn = clientConn.tlsConn
+	encryption.credsspConn = clientConn.memConn
+	encryption.timeout = 2 * time.Second
+
+	response := []byte("sensitive data payload")
+	_, err = serverConn.tlsConn.Write(response)
+	c.Assert(err, IsNil)
+
+	sealedFirst, err := serverConn.memConn.popOutgoing(5 * time.Second)
+	c.Assert(err, IsNil)
+	sealed := serverConn.memConn.drainOutgoing(sealedFirst)
+
+	// Corrupt the final ciphertext byte; TLS AEAD verification must fail.
+	sealed[len(sealed)-1] ^= 0xFF
+
+	cipherName := tls.CipherSuiteName(clientConn.tlsConn.ConnectionState().CipherSuite)
+	trailer := encryption.getCredSSPTrailerLength(len(response), cipherName)
+	payload := make([]byte, 4+len(sealed))
+	binary.LittleEndian.PutUint32(payload[:4], uint32(trailer))
+	copy(payload[4:], sealed)
+
+	_, err = encryption.decryptCredsspMessage(payload, "host", len(response))
+	c.Assert(err, NotNil)
+}
+
+// TestCredSSPFinalMessageIsSendOnly guards finding 3: the final authInfo message
+// must not block or fail waiting for a server reply that never comes.
+func (s *WinRMSuite) TestCredSSPFinalMessageIsSendOnly(c *C) {
+	clientConn, _, err := newCredSSPTLSHarness()
+	c.Assert(err, IsNil)
+
+	ts, _, _, err := StartTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	c.Assert(err, IsNil)
+	defer ts.Close()
+
+	client := &ClientCredSSP{
+		httpClient: &http.Client{},
+		endpoint:   &Endpoint{Timeout: 5 * time.Second},
+		tlsConn:    clientConn.tlsConn,
+		memConn:    clientConn.memConn,
+	}
+
+	err = client.sendTSRequestNoReply(ts.URL, tsRequest{
+		Version:  credSSPDefaultVersion,
+		AuthInfo: []byte("delegated-credentials"),
+	})
+	c.Assert(err, IsNil)
+}
+
+// TestCredSSPReplyRequiredFailsWithoutToken confirms the reply-required path
+// still errors when no CredSSP token is returned, i.e. the send-only path above
+// is genuinely necessary for the final message.
+func (s *WinRMSuite) TestCredSSPReplyRequiredFailsWithoutToken(c *C) {
+	clientConn, _, err := newCredSSPTLSHarness()
+	c.Assert(err, IsNil)
+
+	ts, _, _, err := StartTestServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	c.Assert(err, IsNil)
+	defer ts.Close()
+
+	client := &ClientCredSSP{
+		httpClient: &http.Client{},
+		endpoint:   &Endpoint{Timeout: 5 * time.Second},
+		tlsConn:    clientConn.tlsConn,
+		memConn:    clientConn.memConn,
+	}
+
+	_, err = client.sendTSRequest(ts.URL, tsRequest{
+		Version:    credSSPDefaultVersion,
+		NegoTokens: []negoDataItem{{NegoToken: []byte("token")}},
+	})
+	c.Assert(err, NotNil)
+}
+
+// TestCredSSPMemoryConnCloseRace guards finding 7: Close must not race with
+// concurrent pushIncoming senders (a closed incoming channel would panic).
+func TestCredSSPMemoryConnCloseRace(t *testing.T) {
+	for iteration := 0; iteration < 50; iteration++ {
+		conn := newCredSSPMemoryConn()
+
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				if err := conn.pushIncoming([]byte("payload")); err != nil {
+					return
+				}
+			}
+		}()
+
+		conn.Close()
+		wg.Wait()
+	}
 }
 
 func (s *WinRMSuite) TestFindCredSSPToken(c *C) {
@@ -174,10 +405,12 @@ func newCredSSPTLSHarness() (*credSSPTLSEndpoint, *credSSPTLSEndpoint, error) {
 		//nolint:gosec
 		InsecureSkipVerify: true,
 		MinVersion:         tls.VersionTLS12,
+		MaxVersion:         tls.VersionTLS12,
 	})
 	serverTLS := tls.Server(serverMem, &tls.Config{
 		Certificates: []tls.Certificate{certificate},
 		MinVersion:   tls.VersionTLS12,
+		MaxVersion:   tls.VersionTLS12,
 	})
 
 	clientErr := make(chan error, 1)

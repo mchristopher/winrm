@@ -27,6 +27,7 @@ type Encryption struct {
 	ntlmhttp       *ntlmhttp.Client
 	tlsConn        *tls.Conn
 	credsspConn    *credSSPMemoryConn
+	timeout        time.Duration
 }
 
 const (
@@ -271,7 +272,7 @@ func (e *Encryption) decryptResponse(response *http.Response, host string) ([]by
 			payload = payload[:len(payload)-boundaryLength-4]
 		}
 		encryptedData := bytes.ReplaceAll(payload, []byte("\tContent-Type: application/octet-stream\r\n"), []byte{})
-		decryptedMessage, err := e.decryptMessage(encryptedData, host)
+		decryptedMessage, err := e.decryptMessage(encryptedData, host, expectedLength)
 		if err != nil {
 			return nil, err
 		}
@@ -287,12 +288,12 @@ func (e *Encryption) decryptResponse(response *http.Response, host string) ([]by
 	return message, nil
 }
 
-func (e *Encryption) decryptMessage(encryptedData []byte, host string) ([]byte, error) {
+func (e *Encryption) decryptMessage(encryptedData []byte, host string, expectedLength int) ([]byte, error) {
 	switch e.protocol {
 	case "ntlm":
 		return e.decryptNtlmMessage(encryptedData, host)
 	case "credssp":
-		return e.decryptCredsspMessage(encryptedData, host)
+		return e.decryptCredsspMessage(encryptedData, host, expectedLength)
 	case "kerberos":
 		return e.decryptKerberosMessage(encryptedData, host)
 	default:
@@ -312,7 +313,7 @@ func (e *Encryption) decryptNtlmMessage(encryptedData []byte, host string) ([]by
 	return message, nil
 }
 
-func (e *Encryption) decryptCredsspMessage(encryptedData []byte, host string) ([]byte, error) {
+func (e *Encryption) decryptCredsspMessage(encryptedData []byte, host string, expectedLength int) ([]byte, error) {
 	if e.tlsConn == nil || e.credsspConn == nil {
 		return nil, errors.New("credssp tls context not initialized")
 	}
@@ -320,27 +321,25 @@ func (e *Encryption) decryptCredsspMessage(encryptedData []byte, host string) ([
 		return nil, errors.New("credssp encrypted payload too short")
 	}
 
-	trailerLength := int(binary.LittleEndian.Uint32(encryptedData[:4]))
+	// Skip the 4-byte CredSSP trailer length prefix and feed the wrapped TLS
+	// record(s) into the tunnel.
 	sealed := encryptedData[4:]
 	if err := e.credsspConn.pushIncoming(sealed); err != nil {
 		return nil, err
 	}
 
-	expectedLength := len(sealed) - trailerLength
-	if expectedLength <= 0 {
-		expectedLength = len(sealed)
-	}
-
-	_ = e.tlsConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_ = e.tlsConn.SetReadDeadline(time.Now().Add(credSSPTimeout(e.timeout)))
 	defer e.tlsConn.SetReadDeadline(time.Time{})
 
+	// The plaintext length is authoritatively given by the MIME OriginalContent
+	// header. A single Read returns at most one TLS record's plaintext, so read
+	// the full declared length across however many records it spans.
 	message := make([]byte, expectedLength)
-	n, err := e.tlsConn.Read(message)
-	if err != nil {
+	if _, err := io.ReadFull(e.tlsConn, message); err != nil {
 		return nil, err
 	}
 
-	return message[:n], nil
+	return message, nil
 }
 
 func (enc *Encryption) decryptKerberosMessage(encryptedData []byte, host string) ([]byte, error) {
@@ -399,7 +398,7 @@ func (e *Encryption) buildCredSSPMessage(message []byte, host string) ([]byte, e
 	if _, err := e.tlsConn.Write(message); err != nil {
 		return nil, err
 	}
-	sealedFirst, err := e.credsspConn.popOutgoing(5 * time.Second)
+	sealedFirst, err := e.credsspConn.popOutgoing(credSSPTimeout(e.timeout))
 	if err != nil {
 		return nil, err
 	}

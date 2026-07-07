@@ -61,7 +61,8 @@ On the remote host, run PowerShell as Administrator and execute:
                 winrm quickconfig
                 Enable-WSManCredSSP -Role Server -Force
                 winrm set winrm/config/service/Auth '@{CredSSP="true"}'
-                winrm set winrm/config/service '@{AllowUnencrypted="true"}'
+
+CredSSP wraps the WinRM payload in its own TLS-encrypted channel, so there is no need to enable `AllowUnencrypted` for this transport.
 
 To allow the client machine to delegate credentials to this host, configure the client policy or run:
 

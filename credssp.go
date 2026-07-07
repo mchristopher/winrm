@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -23,7 +22,28 @@ import (
 
 const (
 	credSSPHeaderName = "CredSSP"
+
+	// ntlmSignatureLength is the fixed size of an NTLM message signature
+	// (version + checksum + sequence number). MS-CSSP carries this raw
+	// signature immediately followed by the sealed data.
+	ntlmSignatureLength = 16
+
+	// defaultCredSSPTimeout bounds blocking waits when the caller supplied a
+	// zero (unbounded) endpoint timeout.
+	defaultCredSSPTimeout = 60 * time.Second
+
+	credSSPClientBindingLabel = "CredSSP Client-To-Server Binding Hash\x00"
+	credSSPServerBindingLabel = "CredSSP Server-To-Client Binding Hash\x00"
 )
+
+// credSSPTimeout returns a usable timeout, applying a sane floor when the
+// endpoint timeout is zero so that time.After does not fire immediately.
+func credSSPTimeout(d time.Duration) time.Duration {
+	if d <= 0 {
+		return defaultCredSSPTimeout
+	}
+	return d
+}
 
 var (
 	errCredSSPClosed = errors.New("credssp connection is closed")
@@ -83,8 +103,10 @@ func (c *credSSPMemoryConn) Close() error {
 	select {
 	case <-c.closeCh:
 	default:
+		// Only close the signal channel. Closing incoming would race with
+		// concurrent pushIncoming senders and panic; readers already unblock
+		// via closeCh.
 		close(c.closeCh)
-		close(c.incoming)
 	}
 	return nil
 }
@@ -218,6 +240,7 @@ func (c *ClientCredSSP) Post(client *Client, request *soap.SoapMessage) (string,
 		encryption.tlsConn = c.tlsConn
 		encryption.credsspConn = c.memConn
 		encryption.ntlmClient = c.ntlmClient
+		encryption.timeout = credSSPTimeout(c.endpoint.Timeout)
 		c.encryption = encryption
 	}
 
@@ -254,7 +277,9 @@ func (c *ClientCredSSP) ensureHandshake(client *Client) error {
 			c.handshakeComplete = true
 			return nil
 		case out := <-memConn.outgoing:
-			token, err := c.exchangeCredSSPToken(client.url, out)
+			// Drain the whole TLS flight (crypto/tls may emit several writes
+			// per flight) into a single CredSSP token exchange.
+			token, err := c.exchangeCredSSPToken(client.url, memConn.drainOutgoing(out), true)
 			if err != nil {
 				_ = memConn.Close()
 				return err
@@ -273,7 +298,12 @@ func (c *ClientCredSSP) tlsConfig() *tls.Config {
 		//nolint:gosec
 		InsecureSkipVerify: c.endpoint.Insecure || len(c.endpoint.CACert) == 0,
 		ServerName:         c.endpoint.TLSServerName,
-		MinVersion:         tls.VersionTLS12,
+		// Pin TLS 1.2: the header-pump assumes strict request/response
+		// lockstep, and TLS 1.3 completes the client handshake without a
+		// final round-trip, which can leave the client Finished record
+		// queued when Handshake() returns and desync app data.
+		MinVersion: tls.VersionTLS12,
+		MaxVersion: tls.VersionTLS12,
 	}
 
 	if len(c.endpoint.CACert) > 0 {
@@ -324,14 +354,6 @@ func (c *ClientCredSSP) performCredSSPAuth(client *Client) error {
 		return err
 	}
 
-	_, err = c.sendTSRequest(client.url, tsRequest{
-		Version:    version,
-		NegoTokens: []negoDataItem{{NegoToken: authToken}},
-	})
-	if err != nil {
-		return err
-	}
-
 	securitySession := ntlmClient.SecuritySession()
 	if securitySession == nil {
 		return errors.New("credssp ntlm security session not established")
@@ -355,8 +377,12 @@ func (c *ClientCredSSP) performCredSSPAuth(client *Client) error {
 		return err
 	}
 
+	// Send the final NTLM AUTHENTICATE token together with pubKeyAuth in a
+	// single TSRequest, as in the canonical MS-CSSP exchange. The server
+	// replies with its own pubKeyAuth for verification.
 	pubKeyResponse, err := c.sendTSRequest(client.url, tsRequest{
 		Version:     version,
+		NegoTokens:  []negoDataItem{{NegoToken: authToken}},
 		PubKeyAuth:  clientPubKeyAuth,
 		ClientNonce: nonce,
 	})
@@ -384,12 +410,13 @@ func (c *ClientCredSSP) performCredSSPAuth(client *Client) error {
 		return err
 	}
 
-	_, err = c.sendTSRequest(client.url, tsRequest{
+	// authInfo is the last client message; a compliant server sends no
+	// further TSRequest, so this exchange must be send-only.
+	if err := c.sendTSRequestNoReply(client.url, tsRequest{
 		Version:     version,
 		AuthInfo:    wrappedCredentials,
 		ClientNonce: nonce,
-	})
-	if err != nil {
+	}); err != nil {
 		return err
 	}
 
@@ -397,24 +424,33 @@ func (c *ClientCredSSP) performCredSSPAuth(client *Client) error {
 	return nil
 }
 
-func buildPubKeyAuthData(session *ntlmssp.SecuritySession, serverPublicKey []byte, version int, nonce []byte) ([]byte, []byte, error) {
+// computePubKeyAuthPlaintext returns the plaintext the client must wrap for
+// pubKeyAuth and the plaintext it expects the server to return, per the
+// negotiated CredSSP version.
+//
+// For v2-v4 the client sends the server's public key unmodified and the server
+// returns it with its first byte incremented. For v5+ each side sends a SHA-256
+// binding hash over a directional label, the client nonce, and the public key.
+func computePubKeyAuthPlaintext(version int, nonce, serverPublicKey []byte) (clientPlaintext, expectedServer []byte) {
 	if version >= credSSPVersion5 {
-		clientHash := credSSPBindingHash("CredSSP Client-To-Server Binding Hash\x00", nonce, serverPublicKey)
-		serverHash := credSSPBindingHash("CredSSP Server-To-Client Binding Hash\x00", nonce, serverPublicKey)
-		wrapped, err := wrapCredSSPData(session, clientHash)
-		if err != nil {
-			return nil, nil, err
-		}
-		return wrapped, serverHash, nil
+		clientPlaintext = credSSPBindingHash(credSSPClientBindingLabel, nonce, serverPublicKey)
+		expectedServer = credSSPBindingHash(credSSPServerBindingLabel, nonce, serverPublicKey)
+		return clientPlaintext, expectedServer
 	}
 
-	pubKeyPlusOne := append([]byte(nil), serverPublicKey...)
-	pubKeyPlusOne[0]++
-	wrapped, err := wrapCredSSPData(session, pubKeyPlusOne)
+	clientPlaintext = append([]byte(nil), serverPublicKey...)
+	expectedServer = append([]byte(nil), serverPublicKey...)
+	expectedServer[0]++
+	return clientPlaintext, expectedServer
+}
+
+func buildPubKeyAuthData(session *ntlmssp.SecuritySession, serverPublicKey []byte, version int, nonce []byte) ([]byte, []byte, error) {
+	clientPlaintext, expectedServer := computePubKeyAuthPlaintext(version, nonce, serverPublicKey)
+	wrapped, err := wrapCredSSPData(session, clientPlaintext)
 	if err != nil {
 		return nil, nil, err
 	}
-	return wrapped, serverPublicKey, nil
+	return wrapped, expectedServer, nil
 }
 
 func credSSPBindingHash(prefix string, nonce, publicKey []byte) []byte {
@@ -426,35 +462,42 @@ func credSSPBindingHash(prefix string, nonce, publicKey []byte) []byte {
 	return hash[:]
 }
 
-func wrapCredSSPData(session *ntlmssp.SecuritySession, payload []byte) ([]byte, error) {
+// credSSPSecurityContext is the subset of *ntlmssp.SecuritySession used to seal
+// and unseal CredSSP payloads. It exists so the wire framing can be tested with
+// a fake peer without a full NTLM handshake.
+type credSSPSecurityContext interface {
+	Wrap(b []byte) ([]byte, []byte, error)
+	Unwrap(b, signature []byte) ([]byte, error)
+}
+
+// wrapCredSSPData produces the raw SSPI output MS-CSSP expects in the
+// pubKeyAuth and authInfo fields: the NTLM message signature (a fixed 16 bytes)
+// immediately followed by the sealed data, with no length prefix.
+func wrapCredSSPData(session credSSPSecurityContext, payload []byte) ([]byte, error) {
 	sealed, signature, err := session.Wrap(payload)
 	if err != nil {
 		return nil, err
 	}
 
-	data := make([]byte, 4+len(signature)+len(sealed))
-	binary.LittleEndian.PutUint32(data[:4], uint32(len(signature)))
-	copy(data[4:], signature)
-	copy(data[4+len(signature):], sealed)
-
+	data := make([]byte, 0, len(signature)+len(sealed))
+	data = append(data, signature...)
+	data = append(data, sealed...)
 	return data, nil
 }
 
-func unwrapCredSSPData(session *ntlmssp.SecuritySession, payload []byte) ([]byte, error) {
-	if len(payload) < 4 {
+func unwrapCredSSPData(session credSSPSecurityContext, payload []byte) ([]byte, error) {
+	if len(payload) < ntlmSignatureLength {
 		return nil, errors.New("invalid credssp payload")
 	}
-	signatureLength := int(binary.LittleEndian.Uint32(payload[:4]))
-	if len(payload) < 4+signatureLength {
-		return nil, errors.New("invalid credssp signature length")
-	}
 
-	signature := payload[4 : 4+signatureLength]
-	sealed := payload[4+signatureLength:]
+	signature := payload[:ntlmSignatureLength]
+	sealed := payload[ntlmSignatureLength:]
 	return session.Unwrap(sealed, signature)
 }
 
-func (c *ClientCredSSP) sendTSRequest(endpoint string, request tsRequest) (*tsRequest, error) {
+// writeTSRequest marshals the request, pushes it through the TLS tunnel and
+// returns the resulting TLS records (a full drained flight) to POST.
+func (c *ClientCredSSP) writeTSRequest(request tsRequest) ([]byte, error) {
 	payload, err := marshalTSRequest(request)
 	if err != nil {
 		return nil, err
@@ -464,12 +507,21 @@ func (c *ClientCredSSP) sendTSRequest(endpoint string, request tsRequest) (*tsRe
 		return nil, err
 	}
 
-	outgoing, err := c.memConn.popOutgoing(c.endpoint.Timeout)
+	outgoing, err := c.memConn.popOutgoing(credSSPTimeout(c.endpoint.Timeout))
+	if err != nil {
+		return nil, err
+	}
+	return c.memConn.drainOutgoing(outgoing), nil
+}
+
+// sendTSRequest sends a TSRequest and reads the server's TSRequest reply.
+func (c *ClientCredSSP) sendTSRequest(endpoint string, request tsRequest) (*tsRequest, error) {
+	tlsRecords, err := c.writeTSRequest(request)
 	if err != nil {
 		return nil, err
 	}
 
-	responseToken, err := c.exchangeCredSSPToken(endpoint, c.memConn.drainOutgoing(outgoing))
+	responseToken, err := c.exchangeCredSSPToken(endpoint, tlsRecords, true)
 	if err != nil {
 		return nil, err
 	}
@@ -479,7 +531,19 @@ func (c *ClientCredSSP) sendTSRequest(endpoint string, request tsRequest) (*tsRe
 		}
 	}
 
-	return readTSRequest(c.tlsConn, c.endpoint.Timeout)
+	return readTSRequest(c.tlsConn, credSSPTimeout(c.endpoint.Timeout))
+}
+
+// sendTSRequestNoReply sends a final TSRequest (e.g. authInfo) for which the
+// server returns no further TSRequest, so it never blocks on a reply.
+func (c *ClientCredSSP) sendTSRequestNoReply(endpoint string, request tsRequest) error {
+	tlsRecords, err := c.writeTSRequest(request)
+	if err != nil {
+		return err
+	}
+
+	_, err = c.exchangeCredSSPToken(endpoint, tlsRecords, false)
+	return err
 }
 
 func readTSRequest(conn net.Conn, timeout time.Duration) (*tsRequest, error) {
@@ -518,7 +582,7 @@ func isASN1TruncatedError(err error) bool {
 	return strings.Contains(err.Error(), "truncated") || strings.Contains(err.Error(), "data truncated")
 }
 
-func (c *ClientCredSSP) exchangeCredSSPToken(endpoint string, token []byte) ([]byte, error) {
+func (c *ClientCredSSP) exchangeCredSSPToken(endpoint string, token []byte, requireToken bool) ([]byte, error) {
 	req, err := http.NewRequest("POST", endpoint, nil)
 	if err != nil {
 		return nil, err
@@ -545,7 +609,10 @@ func (c *ClientCredSSP) exchangeCredSSPToken(endpoint string, token []byte) ([]b
 		return nil, err
 	}
 	if !found {
-		return nil, fmt.Errorf("credssp server did not return %s token", credSSPHeaderName)
+		if requireToken {
+			return nil, fmt.Errorf("credssp server did not return %s token", credSSPHeaderName)
+		}
+		return nil, nil
 	}
 	return responseToken, nil
 }
