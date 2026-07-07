@@ -240,12 +240,6 @@ if err != nil {
 
 __N.B.:__ CredSSP binds authentication state and its TLS tunnel to a single connection, so all requests on a CredSSP client are serialized. Because a long-polling output `Receive` holds that lock until it returns, concurrent stdin sends are stalled behind each poll. Real-time interactive stdin is therefore not supported over CredSSP; non-interactive `RunCmd`/`RunPS` (no stdin) are unaffected. If the server drops the pinned connection, the client transparently re-runs the handshake once on the next request.
 
-CredSSP versions 2-4 use the public-key binding scheme that predates the CVE-2018-0886 fix. A server advertising an old version causes the client to use that scheme. To refuse such a downgrade, set a minimum version on the transport:
-
-```go
-params.TransportDecorator = func() winrm.Transporter { return &winrm.ClientCredSSP{MinimumVersion: 5} }
-```
-
 ### Running opt-in CredSSP integration tests
 The CredSSP live integration test is disabled by default and only compiled when using the `credssp_integration` build tag.
 

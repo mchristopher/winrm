@@ -142,9 +142,6 @@ func (c *credSSPMemoryConn) Close() error {
 	select {
 	case <-c.closeCh:
 	default:
-		// Only close the signal channel. Closing incoming would race with
-		// concurrent pushIncoming senders and panic; readers already unblock
-		// via closeCh.
 		close(c.closeCh)
 	}
 	return nil
@@ -170,8 +167,6 @@ func (c *credSSPMemoryConn) SetReadDeadline(t time.Time) error {
 }
 
 func (c *credSSPMemoryConn) SetWriteDeadline(_ time.Time) error {
-	// Writes go to a buffered channel and never block meaningfully, so there is
-	// no write deadline to honor.
 	return nil
 }
 
@@ -357,8 +352,6 @@ func (c *ClientCredSSP) post(client *Client, request *soap.SoapMessage) (string,
 	return c.encryption.PrepareEncryptedRequest(client, client.url, []byte(request.String()))
 }
 
-// resetHandshakeState discards the current CredSSP session so the next Post
-// re-runs the handshake on a fresh connection.
 func (c *ClientCredSSP) resetHandshakeState() {
 	if c.memConn != nil {
 		_ = c.memConn.Close()
@@ -566,9 +559,6 @@ func (c *ClientCredSSP) performCredSSPAuth(client *Client) error {
 		return err
 	}
 
-	// The NTLM session is only needed during the handshake (pubKeyAuth binding
-	// and credential wrapping); CredSSP message encryption uses the TLS tunnel
-	// alone, so the ntlm client is intentionally not retained.
 	return nil
 }
 
