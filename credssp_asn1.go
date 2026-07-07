@@ -2,7 +2,9 @@ package winrm
 
 import (
 	"encoding/asn1"
+	"encoding/binary"
 	"errors"
+	"unicode/utf16"
 )
 
 const (
@@ -55,11 +57,22 @@ func unmarshalTSRequest(value []byte) (*tsRequest, error) {
 	return &request, nil
 }
 
+// utf16LEBytes encodes a string as little-endian UTF-16, the encoding Windows
+// requires for the OCTET STRING fields of TSPasswordCreds.
+func utf16LEBytes(s string) []byte {
+	codes := utf16.Encode([]rune(s))
+	out := make([]byte, len(codes)*2)
+	for i, c := range codes {
+		binary.LittleEndian.PutUint16(out[i*2:], c)
+	}
+	return out
+}
+
 func marshalCredentials(domain, user, password string) ([]byte, error) {
 	passwordCreds, err := asn1.Marshal(tspasswordCreds{
-		DomainName: []byte(domain),
-		UserName:   []byte(user),
-		Password:   []byte(password),
+		DomainName: utf16LEBytes(domain),
+		UserName:   utf16LEBytes(user),
+		Password:   utf16LEBytes(password),
 	})
 	if err != nil {
 		return nil, err

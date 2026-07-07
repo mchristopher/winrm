@@ -3,8 +3,10 @@ package winrm
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -498,7 +500,10 @@ func (c *ClientCredSSP) performCredSSPAuth(client *Client) error {
 	if len(c.tlsConn.ConnectionState().PeerCertificates) == 0 {
 		return errors.New("credssp tls peer certificate missing")
 	}
-	serverPublicKey := c.tlsConn.ConnectionState().PeerCertificates[0].RawSubjectPublicKeyInfo
+	serverPublicKey, err := credSSPCertificatePublicKey(c.tlsConn.ConnectionState().PeerCertificates[0])
+	if err != nil {
+		return err
+	}
 
 	nonce := []byte(nil)
 	if version >= credSSPVersion5 {
@@ -594,6 +599,19 @@ func credSSPResponseError(response *tsRequest) error {
 		return fmt.Errorf("credssp server returned error code 0x%08X", uint32(response.ErrorCode))
 	}
 	return nil
+}
+
+// credSSPCertificatePublicKey returns the certificate's public key in the exact
+// form CredSSP binds against: the PKCS#1 RSAPublicKey DER (SEQUENCE of modulus
+// and exponent), NOT the full SubjectPublicKeyInfo. Windows and the reference
+// implementations hash this PKCS#1 encoding, so using SubjectPublicKeyInfo makes
+// pubKeyAuth verification fail on the server.
+func credSSPCertificatePublicKey(cert *x509.Certificate) ([]byte, error) {
+	rsaPub, ok := cert.PublicKey.(*rsa.PublicKey)
+	if !ok {
+		return nil, fmt.Errorf("credssp requires an RSA server certificate, got %T", cert.PublicKey)
+	}
+	return x509.MarshalPKCS1PublicKey(rsaPub), nil
 }
 
 // computePubKeyAuthPlaintext returns the plaintext the client must wrap for
@@ -808,6 +826,7 @@ func (c *ClientCredSSP) exchangeCredSSPToken(endpoint string, token []byte, requ
 	if err != nil {
 		return nil, err
 	}
+
 	if !found {
 		// Surface a real HTTP failure (e.g. 500) rather than masking it as a
 		// missing-token error. A token can legitimately accompany a 401 during

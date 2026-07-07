@@ -57,9 +57,12 @@ func (s *WinRMSuite) TestCredSSPCredentialsRoundTrip(c *C) {
 	rest, err = asn1.Unmarshal(creds.Credentials, &passwordCreds)
 	c.Assert(err, IsNil)
 	c.Assert(len(rest), Equals, 0)
-	c.Assert(string(passwordCreds.DomainName), Equals, "DOMAIN")
-	c.Assert(string(passwordCreds.UserName), Equals, "administrator")
-	c.Assert(string(passwordCreds.Password), Equals, "s3cr3t")
+	// Credentials must be UTF-16LE encoded for Windows.
+	c.Assert(passwordCreds.DomainName, DeepEquals, utf16LEBytes("DOMAIN"))
+	c.Assert(passwordCreds.UserName, DeepEquals, utf16LEBytes("administrator"))
+	c.Assert(passwordCreds.Password, DeepEquals, utf16LEBytes("s3cr3t"))
+	// Sanity check the encoding: ASCII chars become byte + 0x00.
+	c.Assert(passwordCreds.DomainName[:4], DeepEquals, []byte{'D', 0x00, 'O', 0x00})
 }
 
 func (s *WinRMSuite) TestCredSSPTrailerLengthTable(c *C) {
@@ -346,6 +349,28 @@ func (s *WinRMSuite) TestCredSSPResponseErrorCode(c *C) {
 	err = credSSPResponseError(decoded)
 	c.Assert(err, NotNil)
 	c.Assert(err.Error(), Contains, "0xC000006A")
+}
+
+// TestCredSSPCertificatePublicKey guards that CredSSP binds against the PKCS#1
+// RSAPublicKey encoding, not the full SubjectPublicKeyInfo (a mismatch here
+// makes real Windows servers reject pubKeyAuth).
+func (s *WinRMSuite) TestCredSSPCertificatePublicKey(c *C) {
+	certificate, err := generateCredSSPTestCertificate()
+	c.Assert(err, IsNil)
+
+	parsed, err := x509.ParseCertificate(certificate.Certificate[0])
+	c.Assert(err, IsNil)
+
+	pkcs1, err := credSSPCertificatePublicKey(parsed)
+	c.Assert(err, IsNil)
+
+	rsaPub, ok := parsed.PublicKey.(*rsa.PublicKey)
+	c.Assert(ok, Equals, true)
+	c.Assert(pkcs1, DeepEquals, x509.MarshalPKCS1PublicKey(rsaPub))
+
+	// It must NOT be the SubjectPublicKeyInfo (the previous, incorrect form).
+	c.Assert(bytes.Equal(pkcs1, parsed.RawSubjectPublicKeyInfo), Equals, false)
+	c.Assert(len(pkcs1) < len(parsed.RawSubjectPublicKeyInfo), Equals, true)
 }
 
 // TestNegotiateCredSSPVersion guards the version floor and the CVE-2018-0886
